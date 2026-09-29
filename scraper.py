@@ -8,25 +8,15 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 load_dotenv()
 
-#TELEGRAM_NOTIFICATION-------------------------------------
 
 token = os.getenv("TELEGRAM_BOT_TOKEN")
 
 url_bot = f"https://api.telegram.org/bot{token}/sendMessage"
 chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-data = {
-    "chat_id": chat_id,
-    "text": "Hello from my job scraper!"
-}
-
-#TELEGRAM_NOTIFICATION-------------------------------------
-
-#WEBSITE_LINK---------------------------------------------
 
 url = "https://dev.bg/company/jobs/junior-intern/"
 
-#WEBSITE_LINK---------------------------------------------
 
 keywords = [
     "python",
@@ -34,7 +24,6 @@ keywords = [
     "docker",
 ]
 
-#JOB_MATCHING---------------------------------------------
 
 def matches_keywords(job):
     search_text = job["title"] + " " + " ".join(job["technologies"])
@@ -48,42 +37,16 @@ def matches_keywords(job):
 
     return False
 
-#JOB_MATCHING---------------------------------------------
 
-#CREATING_DICT--------------------------------------------
 
-def run_scraper():
-
-    print("Running scraper...")
-
-    all_jobs = []
-
-    # SQL_DB---------------------------------------------------
-
-    connection = sqlite3.connect("jobs.db")
-    cursor = connection.cursor()
-
-    cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS jobs
-                   (
-                       id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                       title   TEXT,
-                       company TEXT,
-                       link    TEXT UNIQUE,
-                       date    TEXT
-                   )
-                   """)
-
-    connection.commit()
-
-    # SQL_DB---------------------------------------------------
-
+def scrape_jobs():
     response = requests.get(url)
 
     soup = BeautifulSoup(response.text, "html.parser")
 
     jobs = soup.find_all("div", class_="job-list-item")
 
+    all_jobs = []
 
     for job_element in jobs:
         job = {}
@@ -115,35 +78,76 @@ def run_scraper():
 
         job["technologies"] = technology_list
 
-    #CREATING_DICT--------------------------------------------
+        all_jobs.append(job)
 
-        if matches_keywords(job):
-            all_jobs.append(job)
+    return all_jobs
 
-    #DB_INSERT--------------------------------------------------
 
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO jobs (title, company, link, date)
-                VALUES (?, ?, ?, ?)
-                """, (
-                    job["title"],
-                    job["company"],
-                    job["link"],
-                    job["date"],
-                )
-            )
+def save_job(job):
+    connection = sqlite3.connect("jobs.db")
+    cursor = connection.cursor()
 
-            if cursor.rowcount == 1:
-                print("NEW JOB:", job["title"])
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            company TEXT,
+            link TEXT UNIQUE,
+            date TEXT
+        )
+    """)
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO jobs (title, company, link, date)
+        VALUES (?, ?, ?, ?)
+    """, (
+        job["title"],
+        job["company"],
+        job["link"],
+        job["date"],
+    ))
+
+    is_new = cursor.rowcount == 1
 
     connection.commit()
+    connection.close()
 
-#DB_INSERT--------------------------------------------------
+    return is_new
+
+def send_telegram_message(job):
+    message = f"""
+New job found!
+
+{job["title"]}
+Company: {job["company"]}
+
+{job["link"]}
+"""
+
+    data = {
+        "chat_id": chat_id,
+        "text": message
+    }
+
+    response = requests.post(url_bot, data=data)
+
+    print("Telegram response:", response.json())
+
+
+def run_scraper():
+    jobs = scrape_jobs()
+    for job in jobs:
+        if matches_keywords(job):
+            is_new = save_job(job)
+
+            if is_new:
+                print("NEW JOB:", job["title"])
+                send_telegram_message(job)
+
 
 scheduler = BlockingScheduler()
 
-scheduler.add_job(run_scraper, "interval", seconds=5)
+scheduler.add_job(run_scraper, "interval", seconds=30)
 
 print("Job agent started. Checking every hour...")
 
