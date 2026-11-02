@@ -5,9 +5,47 @@ import sqlite3
 import os
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
+from openai import OpenAI
+import json, os, re, time
 
 load_dotenv()
 
+llm = OpenAI(base_url=os.getenv("LLM_BASE_URL"), api_key=os.getenv("LLM_API_KEY"))
+
+SYSTEM = (
+    "You write concise, honest cover letters for a junior/intern applicant. "
+    "Only claim skills and experience that appear in the CV. Never invent anything. "
+    "Keep the letter under 180 words, no clichés. "
+    'Reply with JSON only: {"fit_score": 0-10, "reasons": "one sentence", "cover_letter": "..."}'
+)
+
+
+def draft_application(job, description=""):
+    cv = open("cv.txt", encoding="utf-8").read()
+    prompt = (
+        f"CV:\n{cv}\n\n"
+        f"Job: {job['title']} at {job['company']}\n"
+        f"Technologies: {', '.join(job['technologies'])}\n"
+        f"Description:\n{description or '(not available)'}"
+    )
+
+    for attempt in range(3):
+        try:
+            resp = llm.chat.completions.create(
+                model=os.getenv("LLM_MODEL"),
+                messages=[
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+            )
+            text = resp.choices[0].message.content
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            return json.loads(match.group(0))
+        except Exception as e:
+            print(f"Draft attempt {attempt + 1} failed:", e)
+            time.sleep(20 * (attempt + 1))  # backs off on 429s
+    return None  # caller falls back to the plain alert
 
 token = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -15,7 +53,7 @@ url_bot = f"https://api.telegram.org/bot{token}/sendMessage"
 chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
 
-url = "https://dev.bg/company/jobs/junior-intern/"
+url_dev = "https://dev.bg/company/jobs/junior-intern/"
 
 
 keywords = [
@@ -39,49 +77,32 @@ def matches_keywords(job):
 
 
 
-def scrape_jobs():
-    response = requests.get(url)
+HEADERS = {"User-Agent": "Mozilla/5.0 (personal job-alert script)"}
 
+def scrape_dev_bg():
+    response = requests.get(url_dev, headers=HEADERS, timeout=15)
+    response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
 
-    jobs = soup.find_all("div", class_="job-list-item")
-
     all_jobs = []
-
-    for job_element in jobs:
-        job = {}
-        technology_list = []
-
-        title = job_element.find("h6", class_="job-title")
-        job["title"] = title.get_text(strip=True)
-
-        link = job_element.find("a")["href"]
-        job["link"] = link
-
-        company = job_element.find("span", class_="company-name")
-        job["company"] = company.get_text(strip=True)
-
-        date = job_element.find("span", class_="date")
-        job["date"] = date.get_text(strip=True)
-
-        technologies = job_element.find(
-            "div",
-            class_="tech-stack-wrap hide-for-small"
-        )
-
-        for tech in technologies.find_all(
-            "div",
-            class_="component-square-badge"
-        ):
-            image = tech.find("img")
-            technology_list.append(image["title"])
-
-        job["technologies"] = technology_list
-
-        all_jobs.append(job)
-
+    for el in soup.find_all("div", class_="job-list-item"):
+        try:
+            tech_wrap = el.find("div", class_="tech-stack-wrap")
+            techs = [
+                t.find("img")["title"]
+                for t in (tech_wrap.find_all("div", class_="component-square-badge") if tech_wrap else [])
+                if t.find("img")
+            ]
+            all_jobs.append({
+                "title": el.find("h6", class_="job-title").get_text(strip=True),
+                "link": el.find("a")["href"],
+                "company": el.find("span", class_="company-name").get_text(strip=True),
+                "date": el.find("span", class_="date").get_text(strip=True),
+                "technologies": techs,
+            })
+        except (AttributeError, KeyError, TypeError) as e:
+            print("Skipping malformed listing:", e)
     return all_jobs
-
 
 def save_job(job):
     connection = sqlite3.connect("jobs.db")
@@ -114,42 +135,28 @@ def save_job(job):
 
     return is_new
 
-def send_telegram_message(job):
-    message = f"""
-New job found!
-
-{job["title"]}
-Company: {job["company"]}
-
-{job["link"]}
-"""
-
-    data = {
-        "chat_id": chat_id,
-        "text": message
-    }
-
-    response = requests.post(url_bot, data=data)
-
-    print("Telegram response:", response.json())
+def send_telegram_message(job, draft=None):
+    message = f"New job found!\n\n{job['title']}\nCompany: {job['company']}\n{job['link']}"
+    if draft:
+        message += (
+            f"\n\nFit: {draft['fit_score']}/10 - {draft['reasons']}"
+            f"\n\n--- Cover letter ---\n{draft['cover_letter']}"
+        )
+    r = requests.post(url_bot, data={"chat_id": chat_id, "text": message[:4000]})
+    print("Telegram:", r.status_code)
 
 
 def run_scraper():
-    jobs = scrape_jobs()
-    for job in jobs:
-        if matches_keywords(job):
-            is_new = save_job(job)
-
-            if is_new:
-                print("NEW JOB:", job["title"])
-                send_telegram_message(job)
+    for job in scrape_dev_bg():
+        if matches_keywords(job) and save_job(job):
+            draft = draft_application(job)
+            send_telegram_message(job, draft)
+            time.sleep(5)  # stay under the per-minute limit
 
 
 scheduler = BlockingScheduler()
 
-scheduler.add_job(run_scraper, "interval", seconds=30)
-
-print("Job agent started. Checking every hour...")
-
+scheduler.add_job(run_scraper, "interval", hours=1)
+scheduler.start()
 scheduler.start()
 
